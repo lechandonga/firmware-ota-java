@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### OTA runtime data (local device storage & package source) ###
+data/
