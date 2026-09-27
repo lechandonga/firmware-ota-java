@@ -24,6 +24,13 @@ public class DeviceState {
     public int totalChunks;
     /** 升级是否由断点恢复继续。 */
     public boolean resumed;
+    /**
+     * 本次升级内“已暂存数据被判定不可用并重处理”的轮次（跨重启持久化，
+     * 超过 firmware.ota.max-repair-attempts 即失败收场）。
+     */
+    public int repairAttempts;
+    /** 本次升级内累计被判定不可用并重处理的块数（可观测）。 */
+    public int repairedChunks;
     /** 待启动后处理的回滚原因（TESTING 失败/掉电恢复时使用）。 */
     public FailureReason pendingRollbackReason;
     /** 最近一次拒绝原因（供查询，区分不同拒绝场景）。 */

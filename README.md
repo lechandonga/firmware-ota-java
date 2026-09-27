@@ -129,6 +129,47 @@
 * 重新升级同一 `upgradeId` 时，从位图边界继续，只处理尚未通过校验的块；
 * 成功完成的升级在记录中标记 `resumed=true`，与一次传完可区分。
 
+### 4.1 已暂存数据损坏的自动重处理（设备存储不可靠兜底）
+
+设备掉电/强杀后，**已写入暂存区并被位图承认的数据本身也可能损坏**
+（闪存老化、坏块、半截写入、内容翻位）。旧行为下这种损坏要到组装时才暴露，
+且无法定位坏块，表现为“进度看着快满却永远推不动，重启也没用”。
+
+现在的处理：
+
+* **续传前审计**：恢复同一升级时，逐个复核位图中块的实际内容
+  （文件是否存在、实际哈希与位图/清单是否一致），把不可用的块**从位图剔除
+  并删除文件**，只重传这些块；复核通过的块保留，绝不重复处理。
+* **组装失败兜底**：传输完成后组装复核（逐块 + 整体哈希）仍失败时，
+  同样审计剔除坏块并回到传输继续，而不是卡死。
+* **进度真实**：剔除坏块后 `verifiedChunks`/进度百分比回退到真实可用数据，
+  不会出现“显示快完成、实际推不动”。
+* **可观测**：状态查询暴露 `repairAttempts`（重处理轮次）与
+  `repairedChunks`（累计重处理块数）；升级记录（含 `SUCCEEDED`/`FAILED`/
+  `ROLLED_BACK`）带 `repairedChunks` 字段，能看出本次续传是否发生过
+  “数据不可用被重处理”以及处理了多少。
+* **有边界**：同一升级的重处理轮次计入持久化状态（跨重启有效），超过
+  `max-repair-attempts`（默认 3）即按 `FAILED` +
+  `STAGED_DATA_REPAIR_EXHAUSTED` 收场：保留在位可运行版本、释放全部暂存空间、
+  状态回到 `IDLE`，同一升级可稍后作为全新尝试重新发起。
+  `FAILED`（失败）与 `REJECTED`（拒绝）是两种可区分的结果。
+
+**能自动恢复**：部分暂存块损坏/丢失/位图条目损坏，且重处理轮次未超限。
+**只能拒绝或失败**：升级包来源本身被篡改（`PAYLOAD_TAMPERED`，拒绝）；
+重处理次数超限（`STAGED_DATA_REPAIR_EXHAUSTED`，失败）。
+
+**本地复现/验证**：
+
+1. 自动化：`mvn test -Dtest=CorruptStagingRecoveryTest`（含重启视角）。
+2. 手动：启动服务后 `POST /api/ota/upgrades` 发起一个升级并在传输中途
+   杀掉进程；修改或删除 `data/device-storage/staging/<upgradeId>/chunks/`
+   下某个 `NNNNNN.part`（模拟坏块/翻位）；重新启动并再次
+   `POST /api/ota/upgrades` 同一包。`GET /api/ota/state` 可见
+   `repairAttempts/repairedChunks` 增加、进度先回退再推进；
+   `GET /api/ota/history` 中成功记录带 `repairedChunks>0`。
+   反复破坏暂存数据超过 `max-repair-attempts` 次，则历史出现
+   `FAILED` / `STAGED_DATA_REPAIR_EXHAUSTED`，暂存目录被清空。
+
 ---
 
 ## 5. 版本策略与回滚规则
@@ -179,6 +220,7 @@
 | `max-storage-bytes` | `268435456` (256 MiB) | 存储总占用上限 |
 | `chunk-size` | `4096` | 分块大小（续传粒度） |
 | `selftest-timeout-millis` | `2000` | 首启自检超时 |
+| `max-repair-attempts` | `3` | 同一升级内已暂存数据损坏自动重处理的次数上限，超限按 `STAGED_DATA_REPAIR_EXHAUSTED` 失败收场 |
 
 ---
 
@@ -210,6 +252,10 @@ mvn test
   型号/硬件错配、包过大；拒绝原因可区分且在位版本不变。
 * `ResumableTransferTest`：写入中断后续传只处理未校验块、脏块不被采用、
   `.wr` 不残留、重复请求不重置进度。
+* `CorruptStagingRecoveryTest`：中断后已暂存数据被破坏（翻位/丢失），
+  重启后续传自动剔除坏块、只重传损坏部分并正常完成；进度与真实可用数据一致；
+  重处理超限时按 `STAGED_DATA_REPAIR_EXHAUSTED` 失败、保留在位版本并释放暂存，
+  之后可重新发起成功。
 * `RollbackTest`：自检失败/超时自动回滚且原因可区分、自检中强杀后重启回滚、
   回滚记录不被后续成功升级覆盖、回滚后重启稳定。
 * `PowerLossInstallTest`：槽位提交前掉电，旧版本持续可启动、候选槽不被承认、

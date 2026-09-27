@@ -180,6 +180,7 @@ public class BootRecovery {
         Version candidate = state.candidateVersion;
         String upgradeId = state.activeUpgradeId;
         boolean resumed = state.resumed;
+        int repairedChunks = state.repairedChunks;
 
         state.phase = UpdatePhase.ROLLING_BACK;
         state.pendingRollbackReason = reason;
@@ -210,6 +211,8 @@ public class BootRecovery {
         state.verifiedChunks = 0;
         state.totalChunks = 0;
         state.resumed = false;
+        state.repairAttempts = 0;
+        state.repairedChunks = 0;
         stateStore.save(state);
 
         // 回滚记录 append-only：只要存在被回滚的候选版本就记录，永不被后续升级覆盖
@@ -223,7 +226,8 @@ public class BootRecovery {
                     target,
                     Instant.now(),
                     Instant.now(),
-                    resumed));
+                    resumed,
+                    repairedChunks));
         }
         log.warn("{}回滚完成 candidate={} -> running={} reason={}",
                 automatic ? "自动" : "手动", candidate, target, reason);

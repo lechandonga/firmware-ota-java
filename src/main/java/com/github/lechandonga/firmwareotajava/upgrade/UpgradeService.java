@@ -176,28 +176,61 @@ public class UpgradeService {
             // 初始化/续传升级状态
             beginOrResumeUpgrade(state, manifest, resumed);
 
-            // 5) 断点续传：逐块读取来源 -> 逐块哈希校验 -> 暂存。
-            //    模拟中断时抛 TransferInterruptedException（已校验块保留）。
-            try {
-                transferChunks(packageDir, state, manifest);
-            } catch (TransferInterruptedException interrupted) {
-                state.phase = UpdatePhase.INTERRUPTED;
-                stateStore.save(state);
-                log.warn("传输中断 upgradeId={} 已完成 {}/{} 块，已校验数据保留，其余重传",
-                        manifest.upgradeId(), state.verifiedChunks, state.totalChunks);
-                return null;
-            } catch (PackageRejectedRuntime tampered) {
-                return onRejected(state, manifest, tampered.reason, tampered.getMessage());
+            // 4.5) 续传前审计：设备存储不可靠（坏块/翻位/半截写入）时，
+            //      上次已暂存的数据可能已损坏。剔除不可用块，只重传这些块，
+            //      未受影响的部分不重复处理；重处理次数受上限约束。
+            if (resumed) {
+                java.util.List<Integer> evicted =
+                        stagingStore.evictInvalidChunks(manifest.upgradeId(), manifest);
+                if (!evicted.isEmpty()) {
+                    UpgradeRecord failed =
+                            registerRepair(state, manifest, evicted.size(), startedAt);
+                    if (failed != null) {
+                        return failed;
+                    }
+                }
             }
 
-            // 6) 组装 + 安装到非活动槽（活动槽全程只读运行）
-            state.phase = UpdatePhase.INSTALLING;
-            stateStore.save(state);
-            Path assembled = stagingStore.assemble(manifest.upgradeId(), manifest);
+            // 5) 断点续传：逐块读取来源 -> 逐块哈希校验 -> 暂存。
+            //    组装复核发现暂存数据损坏时，审计剔除坏块后回到传输继续，
+            //    避免“进度看着快满却永远推不动”。
+            Path assembled = null;
+            while (assembled == null) {
+                try {
+                    transferChunks(packageDir, state, manifest);
+                } catch (TransferInterruptedException interrupted) {
+                    state.phase = UpdatePhase.INTERRUPTED;
+                    stateStore.save(state);
+                    log.warn("传输中断 upgradeId={} 已完成 {}/{} 块，已校验数据保留，其余重传",
+                            manifest.upgradeId(), state.verifiedChunks, state.totalChunks);
+                    return null;
+                } catch (PackageRejectedRuntime tampered) {
+                    return onRejected(state, manifest, tampered.reason, tampered.getMessage());
+                }
+
+                // 6) 组装（含逐块复核 + 整体哈希校验）
+                state.phase = UpdatePhase.INSTALLING;
+                stateStore.save(state);
+                try {
+                    assembled = stagingStore.assemble(manifest.upgradeId(), manifest);
+                } catch (IllegalStateException corrupt) {
+                    log.warn("组装复核发现已暂存数据不可用（{}），审计剔除后重处理",
+                            corrupt.getMessage());
+                    java.util.List<Integer> evicted =
+                            stagingStore.evictInvalidChunks(manifest.upgradeId(), manifest);
+                    UpgradeRecord failed =
+                            registerRepair(state, manifest, evicted.size(), startedAt);
+                    if (failed != null) {
+                        return failed;
+                    }
+                }
+            }
+
+            // 7) 安装到非活动槽（活动槽全程只读运行）
             slotInstaller.eraseSlot(state.candidateSlot);
             slotInstaller.install(state.candidateSlot, manifest, assembled);
 
-            // 7) 原子切换（提交点）：此后运行新版本，等待首启自检确认
+            // 8) 原子切换（提交点）：此后运行新版本，等待首启自检确认
             slotSwitcher.switchTo(state.candidateSlot);
             state.phase = UpdatePhase.INSTALLED_PENDING_TEST;
             state.runningVersion = manifest.version();
@@ -218,6 +251,7 @@ public class UpgradeService {
                 // doRollback 已 append ROLLED_BACK 记录（含可区分原因）
                 return latestRecordOf(manifest.upgradeId());
             }            // 9b) 自检通过：确认新版本为 lastGood，释放暂存
+            int repairedChunks = state.repairedChunks;
             state.phase = UpdatePhase.CONFIRMED;
             state.pendingRollbackReason = null;
             state.lastGoodVersion = manifest.version();
@@ -227,11 +261,14 @@ public class UpgradeService {
             state.activeUpgradeId = null;
             state.activeTargetVersion = null;
             state.resumed = false;
+            state.repairAttempts = 0;
+            state.repairedChunks = 0;
             stateStore.save(state);
             stagingStore.cleanup(manifest.upgradeId());
             UpgradeRecord ok = history.append(new UpgradeRecord(
                     manifest.upgradeId(), manifest.version(), "SUCCEEDED",
-                    null, null, null, startedAt, Instant.now(), resumed));
+                    null, null, null, startedAt, Instant.now(), resumed,
+                    repairedChunks));
             log.info("升级成功并确认 version={} upgradeId={} resumed={}",
                     manifest.version(), manifest.upgradeId(), resumed);
             // 确认完成，回到稳态
@@ -265,10 +302,10 @@ public class UpgradeService {
         Path payload = packageDir.resolve("payload.bin");
         int total = manifest.chunkSha256().size();
         try (var channel = Files.newByteChannel(payload)) {
-            int resumeFrom = state.verifiedChunks;
             for (int i = 0; i < total; i++) {
-                if (i < resumeFrom) {
-                    // 续传：跳过位图中已通过校验的块，绝不重复处理
+                if (stagingStore.isChunkVerified(manifest.upgradeId(), i)) {
+                    // 续传/重处理：跳过位图中已通过校验的块，绝不重复处理；
+                    // 被审计剔除的坏块不在位图中，会在此处重新传输
                     continue;
                 }
                 long offset = (long) i * manifest.chunkSize();
@@ -338,6 +375,8 @@ public class UpgradeService {
         state.resumed = resumed;
         if (!resumed) {
             state.verifiedChunks = 0;
+            state.repairAttempts = 0;
+            state.repairedChunks = 0;
         } else {
             state.verifiedChunks =
                     stagingStore.verifiedChunkCount(manifest.upgradeId());
@@ -345,6 +384,54 @@ public class UpgradeService {
         state.pendingRollbackReason = null;
         state.phase = UpdatePhase.DOWNLOADING;
         stateStore.save(state);
+    }
+
+    /**
+     * 登记一次“已暂存数据不可用并重处理”：累计轮次与块数（跨重启持久化），
+     * 进度回退到真实可用块数。超过 firmware.ota.max-repair-attempts 上限时
+     * 按 STAGED_DATA_REPAIR_EXHAUSTED 失败收场并返回失败记录，否则返回 null。
+     */
+    private UpgradeRecord registerRepair(DeviceState state, FirmwareManifest manifest,
+                                         int evictedCount, Instant startedAt) {
+        state.repairAttempts++;
+        state.repairedChunks += evictedCount;
+        state.verifiedChunks = stagingStore.verifiedChunkCount(manifest.upgradeId());
+        stateStore.save(state);
+        log.warn("暂存数据重处理：剔除 {} 个不可用块，第 {}/{} 次 upgradeId={}",
+                evictedCount, state.repairAttempts,
+                properties.getMaxRepairAttempts(), manifest.upgradeId());
+        if (state.repairAttempts > properties.getMaxRepairAttempts()) {
+            return failUpgrade(state, manifest, startedAt);
+        }
+        return null;
+    }
+
+    /**
+     * 重处理次数超限的失败收场：写一条 outcome=FAILED、原因可区分的历史记录，
+     * 释放本次升级占用的全部临时空间，复位进行中状态；在位版本继续运行。
+     */
+    private UpgradeRecord failUpgrade(DeviceState state, FirmwareManifest manifest,
+                                      Instant startedAt) {
+        log.error("暂存数据重处理次数超过上限（{}），升级失败 upgradeId={}",
+                properties.getMaxRepairAttempts(), manifest.upgradeId());
+        int repaired = state.repairedChunks;
+        boolean resumed = state.resumed;
+        stagingStore.cleanup(manifest.upgradeId());
+        state.phase = UpdatePhase.IDLE;
+        state.activeUpgradeId = null;
+        state.activeTargetVersion = null;
+        state.candidateSlot = null;
+        state.candidateVersion = null;
+        state.verifiedChunks = 0;
+        state.totalChunks = 0;
+        state.resumed = false;
+        state.repairAttempts = 0;
+        state.repairedChunks = 0;
+        stateStore.save(state);
+        return history.append(new UpgradeRecord(
+                manifest.upgradeId(), manifest.version(), "FAILED",
+                null, FailureReason.STAGED_DATA_REPAIR_EXHAUSTED, null,
+                startedAt, Instant.now(), resumed, repaired));
     }
 
     private boolean isResumedUpgrade(DeviceState state, String upgradeId) {
@@ -369,7 +456,8 @@ public class UpgradeService {
         return history.append(new UpgradeRecord(
                 manifest != null ? manifest.upgradeId() : "unknown",
                 manifest != null ? manifest.version() : null,
-                "REJECTED", reason, null, null, Instant.now(), Instant.now(), false));
+                "REJECTED", reason, null, null, Instant.now(), Instant.now(),
+                false, 0));
     }
 
     private boolean storageBudgetExceeded(FirmwareManifest manifest) {
@@ -427,7 +515,7 @@ public class UpgradeService {
                 s.runningVersion, s.lastGoodVersion, s.candidateVersion,
                 s.activeSlot, s.candidateSlot, verified, total, percent,
                 s.lastRejectReason, s.lastRejectedUpgradeId,
-                s.pendingRollbackReason);
+                s.pendingRollbackReason, s.repairAttempts, s.repairedChunks);
     }
 
     public List<UpgradeRecord> history() {

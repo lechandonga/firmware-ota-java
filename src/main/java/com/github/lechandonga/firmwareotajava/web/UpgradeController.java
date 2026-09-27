@@ -97,6 +97,8 @@ public class UpgradeController {
                 ? null : s.lastRejectReason().name();
         r.pendingRollbackReason = s.pendingRollbackReason() == null
                 ? null : s.pendingRollbackReason().name();
+        r.repairAttempts = s.repairAttempts();
+        r.repairedChunks = s.repairedChunks();
         return r;
     }
 

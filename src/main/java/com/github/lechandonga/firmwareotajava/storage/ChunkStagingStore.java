@@ -117,6 +117,66 @@ public class ChunkStagingStore {
     }
 
     /**
+     * 审计已暂存数据：逐个复核位图中块的实际内容（设备存储可能因坏块/翻位/
+     * 半截写入而损坏），把不可用的块从位图剔除并删除其文件。
+     *
+     * <p>判定不可用的情形：
+     * <ul>
+     *   <li>.part 文件缺失或读取失败；</li>
+     *   <li>文件实际哈希与位图记录不一致（写入后被破坏）；</li>
+     *   <li>位图记录本身与清单期望哈希不一致（位图条目损坏）。</li>
+     * </ul>
+     *
+     * <p>未受影响（复核通过）的块保留，绝不重复处理。
+     *
+     * @return 被剔除的块下标（升序）；空列表表示暂存数据全部可用
+     */
+    public synchronized java.util.List<Integer> evictInvalidChunks(
+            String upgradeId, FirmwareManifest manifest) {
+        Map<Integer, String> bitmap = loadBitmap(upgradeId);
+        java.util.List<Integer> evicted = new java.util.ArrayList<>();
+        for (Map.Entry<Integer, String> entry : bitmap.entrySet()) {
+            int index = entry.getKey();
+            String recorded = entry.getValue();
+            String expected = index < manifest.chunkSha256().size()
+                    ? manifest.chunkSha256().get(index) : null;
+            boolean usable = recorded != null
+                    && expected != null
+                    && recorded.equalsIgnoreCase(expected)
+                    && fileHashMatches(upgradeId, index, recorded);
+            if (!usable) {
+                evicted.add(index);
+            }
+        }
+        if (evicted.isEmpty()) {
+            return evicted;
+        }
+        for (int index : evicted) {
+            bitmap.remove(index);
+            try {
+                Files.deleteIfExists(chunkFile(upgradeId, index));
+            } catch (IOException e) {
+                log.warn("删除损坏暂存块失败 upgradeId={} index={}", upgradeId, index, e);
+            }
+            log.warn("已暂存块 {} 复核不可用，剔除并重处理 upgradeId={}", index, upgradeId);
+        }
+        saveBitmap(upgradeId, bitmap);
+        return evicted;
+    }
+
+    private boolean fileHashMatches(String upgradeId, int index, String expected) {
+        Path file = chunkFile(upgradeId, index);
+        if (!Files.exists(file)) {
+            return false;
+        }
+        try {
+            return HashUtil.sha256Hex(file).equalsIgnoreCase(expected);
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
      * 按序组装所有已校验块到 assembled 文件（临时文件 + 原子 rename），
      * 并校验总大小与整体哈希，防止残留/拼接错误进入槽位。
      */
