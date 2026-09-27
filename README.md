@@ -126,8 +126,49 @@
   `NNNNNN.part` 并写入 `verified.json` 位图。
 * **只有位图中存在的块才算已通过校验**。写到一半的 `.wr`、或人为放入但未经
   校验的文件，都不会被当作有效数据，恢复后该块重新传输。
-* 重新升级同一 `upgradeId` 时，从位图边界继续，只处理尚未通过校验的块；
+* 重新升级同一 `upgradeId` 时，按位图逐块判断（已校验块**不要求连续**），
+  只处理尚未通过校验的块；
 * 成功完成的升级在记录中标记 `resumed=true`，与一次传完可区分。
+
+### 4.1 暂存数据自愈（设备存储不可靠兜底）
+
+设备掉电/强杀后，**已保存到设备上的暂存数据本身可能损坏**（闪存老化、坏块、
+半截写入、内容翻位）。此时位图仍声称这些块已校验，若直接信任就会出现
+“进度看着快满了却永远推不动、重启依旧”的卡死。自愈机制：
+
+* **续传前复核**：每次断点续传开始时，对位图中每个已校验块重新计算实际
+  SHA-256 并与位图记录比对；内容不符（或文件缺失/不可读）的块被判定不可用，
+  **从位图剔除并删除其数据文件**。
+* **只重处理坏的部分**：被剔除的块在续传中重新传输校验；未受影响的块保持
+  有效，**不会因为一小块坏了就重传整个包**。
+* **进度与真实可用数据一致**：剔除后 `verifiedChunks` 按位图重算，进度百分比
+  随之回落到真实可用水位，随后单调推进直至完成，不会再卡在高进度。
+* **可观测**：状态查询（`GET /api/ota/state`）与升级记录均携带
+  `repairAttempts`（已进行的重处理轮次）与 `repairedChunks`（被重处理的块数）；
+  成功记录里 `repairedChunks>0` 即表示本次续传期间有数据被判定不可用并重处理，
+  与 `REJECTED`（拒绝）、`FAILED`（失败）是相互独立、可区分的信息。
+* **有边界、不死循环**：重处理轮次上限由 `max-repair-attempts`（默认 3）控制。
+  超过上限则以 `outcome=FAILED`、`failureReason=STAGING_DATA_UNRECOVERABLE`
+  明确收场：**在位版本不受影响继续运行**，本次升级的暂存空间被**完全释放**
+  （不会因反复重处理无界占用存储），状态回到 `IDLE`，
+  `lastFailureReason` 可供查询。之后重新发起同一升级将作为全新升级正常进行。
+
+能自动恢复的情形：暂存块损坏但**来源包完好**（重处理从来源重新取数）。
+只能拒绝/失败的情形：来源包本身损坏 → `PAYLOAD_TAMPERED` 拒绝；
+重处理超上限 → `STAGING_DATA_UNRECOVERABLE` 失败。
+
+**本地复现与验证**（对应 `StagingCorruptionRecoveryTest`）：
+
+1. 发起升级并在传输中断（测试用 `enableWriteInterruptAfterChunks` 钩子，
+   或直接kill进程），使 `staging/{upgradeId}/chunks/` 下留有若干 `.part`；
+2. 手工翻位某个 `.part` 文件（如 `printf 'X' | dd of=... bs=1 conv=notrunc`），
+   模拟设备存储上的数据损坏；
+3. 重启服务（`BootRecovery` 恢复到 `INTERRUPTED`），再次
+   `POST /api/ota/upgrades` 同一包：日志可见“暂存数据复核 … 已剔除”，
+   升级最终 `SUCCEEDED` 且记录中 `repairedChunks` 等于被剔除块数；
+4. 反复损坏使重处理超过 `max-repair-attempts`：结果为
+   `FAILED / STAGING_DATA_UNRECOVERABLE`，`staging/{upgradeId}` 被清空，
+   当前运行版本不变；再次发起同一升级可从零正常完成。
 
 ---
 
@@ -179,6 +220,7 @@
 | `max-storage-bytes` | `268435456` (256 MiB) | 存储总占用上限 |
 | `chunk-size` | `4096` | 分块大小（续传粒度） |
 | `selftest-timeout-millis` | `2000` | 首启自检超时 |
+| `max-repair-attempts` | `3` | 同一升级内暂存数据自动重处理轮次上限，超限以 `STAGING_DATA_UNRECOVERABLE` 失败收场 |
 
 ---
 
@@ -187,7 +229,7 @@
 | 方法与路径 | 说明 |
 | --- | --- |
 | `POST /api/ota/upgrades` | body `{"packageName":"v2"}`：发起/续传升级（幂等） |
-| `GET  /api/ota/state` | 当前阶段、运行/候选版本、槽位、进度、最近拒绝原因、待回滚原因 |
+| `GET  /api/ota/state` | 当前阶段、运行/候选版本、槽位、进度、最近拒绝原因、待回滚原因、暂存重处理计数（`repairAttempts`/`repairedChunks`）、最近失败原因 |
 | `GET  /api/ota/history` | 升级与回滚历史（append-only） |
 | `POST /api/ota/rollback` | 手动回滚到最近一次可正常启动版本 |
 
@@ -210,6 +252,10 @@ mvn test
   型号/硬件错配、包过大；拒绝原因可区分且在位版本不变。
 * `ResumableTransferTest`：写入中断后续传只处理未校验块、脏块不被采用、
   `.wr` 不残留、重复请求不重置进度。
+* `StagingCorruptionRecoveryTest`：中断后设备上已保存的暂存数据被损坏，
+  重启续传自行发现、只重处理损坏块并正常完成（含重启后视角）；
+  重处理超上限以 `STAGING_DATA_UNRECOVERABLE` 失败、在位版本保留、
+  临时空间释放、可重新发起；完好续传不误报重处理。
 * `RollbackTest`：自检失败/超时自动回滚且原因可区分、自检中强杀后重启回滚、
   回滚记录不被后续成功升级覆盖、回滚后重启稳定。
 * `PowerLossInstallTest`：槽位提交前掉电，旧版本持续可启动、候选槽不被承认、

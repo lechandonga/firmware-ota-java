@@ -17,5 +17,8 @@ public record UpgradeState(
         int progressPercent,
         RejectReason lastRejectReason,
         String lastRejectedUpgradeId,
-        FailureReason pendingRollbackReason) {
+        FailureReason pendingRollbackReason,
+        int repairAttempts,
+        int repairedChunks,
+        FailureReason lastFailureReason) {
 }

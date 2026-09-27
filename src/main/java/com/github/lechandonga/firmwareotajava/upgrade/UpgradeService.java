@@ -176,6 +176,29 @@ public class UpgradeService {
             // 初始化/续传升级状态
             beginOrResumeUpgrade(state, manifest, resumed);
 
+            // 4.5) 续传前复核设备上已保存的暂存数据：存储不可靠（坏块/翻位/
+            //      半截写入）时，位图声称已校验的块内容可能已损坏。剔除实际不可
+            //      用的块，只重新处理这些块；未受影响的块保持有效、不重复传输。
+            if (resumed) {
+                List<Integer> evicted =
+                        stagingStore.evictCorruptedChunks(manifest.upgradeId());
+                if (!evicted.isEmpty()) {
+                    state.repairAttempts++;
+                    state.repairedChunks += evicted.size();
+                    state.verifiedChunks =
+                            stagingStore.verifiedChunkCount(manifest.upgradeId());
+                    stateStore.save(state);
+                    log.warn("续传复核发现 {} 个已保存块不可用，将只重新处理这些块 "
+                                    + "upgradeId={} 第 {}/{} 次重处理",
+                            evicted.size(), manifest.upgradeId(),
+                            state.repairAttempts, properties.getMaxRepairAttempts());
+                    if (state.repairAttempts > properties.getMaxRepairAttempts()) {
+                        return onStagingUnrecoverable(state, manifest, startedAt,
+                                resumed);
+                    }
+                }
+            }
+
             // 5) 断点续传：逐块读取来源 -> 逐块哈希校验 -> 暂存。
             //    模拟中断时抛 TransferInterruptedException（已校验块保留）。
             try {
@@ -227,11 +250,15 @@ public class UpgradeService {
             state.activeUpgradeId = null;
             state.activeTargetVersion = null;
             state.resumed = false;
+            int repairedChunks = state.repairedChunks;
+            state.repairAttempts = 0;
+            state.repairedChunks = 0;
             stateStore.save(state);
             stagingStore.cleanup(manifest.upgradeId());
             UpgradeRecord ok = history.append(new UpgradeRecord(
                     manifest.upgradeId(), manifest.version(), "SUCCEEDED",
-                    null, null, null, startedAt, Instant.now(), resumed));
+                    null, null, null, startedAt, Instant.now(), resumed,
+                    repairedChunks));
             log.info("升级成功并确认 version={} upgradeId={} resumed={}",
                     manifest.version(), manifest.upgradeId(), resumed);
             // 确认完成，回到稳态
@@ -265,10 +292,10 @@ public class UpgradeService {
         Path payload = packageDir.resolve("payload.bin");
         int total = manifest.chunkSha256().size();
         try (var channel = Files.newByteChannel(payload)) {
-            int resumeFrom = state.verifiedChunks;
             for (int i = 0; i < total; i++) {
-                if (i < resumeFrom) {
-                    // 续传：跳过位图中已通过校验的块，绝不重复处理
+                // 续传：按位图逐块判断是否已通过校验（已校验块可能不连续——
+                // 损坏块被剔除后会出现空洞），只处理缺失块，绝不重复处理
+                if (stagingStore.isChunkVerified(manifest.upgradeId(), i)) {
                     continue;
                 }
                 long offset = (long) i * manifest.chunkSize();
@@ -338,6 +365,8 @@ public class UpgradeService {
         state.resumed = resumed;
         if (!resumed) {
             state.verifiedChunks = 0;
+            state.repairAttempts = 0;
+            state.repairedChunks = 0;
         } else {
             state.verifiedChunks =
                     stagingStore.verifiedChunkCount(manifest.upgradeId());
@@ -369,7 +398,40 @@ public class UpgradeService {
         return history.append(new UpgradeRecord(
                 manifest != null ? manifest.upgradeId() : "unknown",
                 manifest != null ? manifest.version() : null,
-                "REJECTED", reason, null, null, Instant.now(), Instant.now(), false));
+                "REJECTED", reason, null, null, Instant.now(), Instant.now(),
+                false, 0));
+    }
+
+    /**
+     * 暂存数据自动重处理超过配置上限：以明确失败原因收场。
+     * 在位版本不受影响继续运行；释放本次升级占用的全部临时空间，
+     * 写一条 outcome=FAILED、failureReason=STAGING_DATA_UNRECOVERABLE 的记录，
+     * 与 REJECTED（拒绝）/ ROLLED_BACK（回滚）可区分。
+     */
+    private UpgradeRecord onStagingUnrecoverable(DeviceState state,
+                                                 FirmwareManifest manifest,
+                                                 Instant startedAt, boolean resumed) {
+        log.error("暂存数据重处理超过上限（{} 次），升级失败收场 upgradeId={}",
+                properties.getMaxRepairAttempts(), manifest.upgradeId());
+        int repairedChunks = state.repairedChunks;
+        state.phase = UpdatePhase.IDLE;
+        state.lastFailureReason = FailureReason.STAGING_DATA_UNRECOVERABLE;
+        state.activeUpgradeId = null;
+        state.activeTargetVersion = null;
+        state.candidateSlot = null;
+        state.candidateVersion = null;
+        state.verifiedChunks = 0;
+        state.totalChunks = 0;
+        state.resumed = false;
+        state.repairAttempts = 0;
+        state.repairedChunks = 0;
+        stateStore.save(state);
+        // 释放本次升级占用的临时空间，杜绝反复重处理造成的无界占用
+        stagingStore.cleanup(manifest.upgradeId());
+        return history.append(new UpgradeRecord(
+                manifest.upgradeId(), manifest.version(), "FAILED",
+                null, FailureReason.STAGING_DATA_UNRECOVERABLE, null,
+                startedAt, Instant.now(), resumed, repairedChunks));
     }
 
     private boolean storageBudgetExceeded(FirmwareManifest manifest) {
@@ -427,7 +489,8 @@ public class UpgradeService {
                 s.runningVersion, s.lastGoodVersion, s.candidateVersion,
                 s.activeSlot, s.candidateSlot, verified, total, percent,
                 s.lastRejectReason, s.lastRejectedUpgradeId,
-                s.pendingRollbackReason);
+                s.pendingRollbackReason,
+                s.repairAttempts, s.repairedChunks, s.lastFailureReason);
     }
 
     public List<UpgradeRecord> history() {

@@ -15,4 +15,7 @@ public class StateResponse {
     public String lastRejectedUpgradeId;
     public String lastRejectReason;
     public String pendingRollbackReason;
+    public int repairAttempts;
+    public int repairedChunks;
+    public String lastFailureReason;
 }

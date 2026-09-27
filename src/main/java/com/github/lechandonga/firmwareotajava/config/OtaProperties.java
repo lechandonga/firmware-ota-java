@@ -29,6 +29,8 @@ public class OtaProperties {
     private int chunkSize = 64 * 1024;
     /** 首启自检超时（毫秒），超时按失败处理并自动回滚。 */
     private long selftestTimeoutMillis = 5000;
+    /** 同一升级内暂存数据自动重处理的次数上限，超过则以 STAGING_DATA_UNRECOVERABLE 失败收场。 */
+    private int maxRepairAttempts = 3;
 
     public String getStorageDir() { return storageDir; }
     public void setStorageDir(String storageDir) { this.storageDir = storageDir; }
@@ -52,6 +54,8 @@ public class OtaProperties {
     public void setChunkSize(int chunkSize) { this.chunkSize = chunkSize; }
     public long getSelftestTimeoutMillis() { return selftestTimeoutMillis; }
     public void setSelftestTimeoutMillis(long selftestTimeoutMillis) { this.selftestTimeoutMillis = selftestTimeoutMillis; }
+    public int getMaxRepairAttempts() { return maxRepairAttempts; }
+    public void setMaxRepairAttempts(int maxRepairAttempts) { this.maxRepairAttempts = maxRepairAttempts; }
 
     public Version minimumCompatible() {
         return (minimumCompatibleVersion == null || minimumCompatibleVersion.isBlank())

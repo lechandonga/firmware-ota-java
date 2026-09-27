@@ -97,6 +97,52 @@ public class ChunkStagingStore {
         }
     }
 
+    /**
+     * 续传前复核：逐块重新计算位图中每个已校验块的实际哈希。
+     *
+     * <p>设备存储不可靠时（闪存老化、坏块、半截写入、翻位），位图声称已校验的
+     * 块内容可能已损坏。本方法把实际内容与位图记录不符（或文件缺失/不可读）的
+     * 块从位图中剔除并删除其数据文件，使续传只重新处理这些真正有问题的块，
+     * 未受影响的块保持有效、不重复传输。
+     *
+     * @return 被剔除（判定不可用）的块下标列表，按升序
+     */
+    public synchronized java.util.List<Integer> evictCorruptedChunks(String upgradeId) {
+        Map<Integer, String> bitmap = loadBitmap(upgradeId);
+        if (bitmap.isEmpty()) {
+            return java.util.List.of();
+        }
+        java.util.List<Integer> evicted = new java.util.ArrayList<>();
+        for (Map.Entry<Integer, String> entry : bitmap.entrySet()) {
+            Path part = chunkFile(upgradeId, entry.getKey());
+            boolean usable = false;
+            try {
+                usable = Files.isRegularFile(part)
+                        && HashUtil.sha256Hex(part).equalsIgnoreCase(entry.getValue());
+            } catch (IOException e) {
+                usable = false;
+            }
+            if (!usable) {
+                evicted.add(entry.getKey());
+            }
+        }
+        if (evicted.isEmpty()) {
+            return evicted;
+        }
+        for (Integer idx : evicted) {
+            bitmap.remove(idx);
+            try {
+                Files.deleteIfExists(chunkFile(upgradeId, idx));
+            } catch (IOException e) {
+                log.warn("删除损坏暂存块失败 upgradeId={} index={}", upgradeId, idx, e);
+            }
+        }
+        saveBitmap(upgradeId, bitmap);
+        log.warn("暂存数据复核：{} 个已校验块实际不可用，已剔除并将重新处理 upgradeId={} chunks={}",
+                evicted.size(), upgradeId, evicted);
+        return evicted;
+    }
+
     public synchronized long verifiedBytes(String upgradeId, FirmwareManifest manifest) {
         Map<Integer, String> bitmap = loadBitmap(upgradeId);
         long bytes = 0;
